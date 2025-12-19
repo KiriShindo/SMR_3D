@@ -2,7 +2,6 @@
 import os
 import time
 import json
-import random
 from pathlib import Path
 from tkinter import Tk, filedialog
 import csv
@@ -15,7 +14,6 @@ import matplotlib.pyplot as plt
 from PIL import Image
 
 import torch
-import torch.nn as nn
 
 # detectron2
 from detectron2.config import get_cfg
@@ -28,8 +26,8 @@ from detectron2.data import MetadataCatalog
 # Arduino serial
 from serial import Serial
 
-# ★ 学習側で定義した 3D IKモデルを import
-#   あなたが貼ってくれたクラス名は IKBeamNet なのでそれを使う
+# ★ あなたのIKモデル定義に合わせて import（パス/ファイル名は適宜）
+# from IK_randompair_train import IKBeamNet
 from IK_randompair_train import IKBeamNet
 
 
@@ -39,47 +37,47 @@ from IK_randompair_train import IKBeamNet
 
 matplotlib.rcParams["font.family"] = "Times New Roman"
 
-
 # Arduino / カメラ
 SERIAL_PORT = "COM4"
 BAUDRATE = 9600
 CAMERA_INDEX = 0
 CAM_W, CAM_H = 1920, 1080
 
-BASE_ROOT = r"C:/Users/ishiz/Documents/Akamine_workspace/master_thesis_2025/SMR_control_3D/IK_only_result_sorted"
+BASE_ROOT = r"C:/Users/ishiz/Documents/Akamine_workspace/master_thesis_2025/SMR_control_3D/IK_only_result_mult_weight2"
 
 # ------------------------
 # 実験パラメータ
 # ------------------------
+WEIGHT = 0
 K_GAIN = 1.0
 NUM_LOOP = 10
-RESET_EACH_LOOP = True
+RESET_EACH_LOOP = False
 WAIT_TIME = 3.0
 LOOP_WAIT = 5.0
-MAX_MODULE = 1
+MAX_MODULE = 5
+
+# ★ trial回数
+N_TRIALS = 1
 
 # ------------------------
 # 保存パス生成
 # ------------------------
 maxmod_dir = os.path.join(BASE_ROOT, f"maxmod_{MAX_MODULE}")
-
 cond_name = (
+    f"WEIGHT{WEIGHT}"
     f"K{K_GAIN}"
     f"_LOOP{NUM_LOOP}"
     f"_RESET{int(RESET_EACH_LOOP)}"
     f"_WAIT{WAIT_TIME}"
     f"_LOOPWAIT{LOOP_WAIT}"
+    f"_TRIAL{N_TRIALS}"
 )
-
 SAVE_ROOT = os.path.join(maxmod_dir, cond_name)
 os.makedirs(SAVE_ROOT, exist_ok=True)
-
 print(f"[INFO] Save root: {SAVE_ROOT}")
-
 
 # ROI設定（USBカメラ側）
 ROI_CONFIG_FULL = r"C:/Users/ishiz/Documents/Akamine_workspace/master_thesis_2025/SMR_control_3D/devision_net/roi_config_full.json"
-
 
 # =========================================================
 #  Detectron2: devnet / seg-net 設定
@@ -91,7 +89,6 @@ DEVNET_TRAIN_IMAGES = r"C:/Users/ishiz/Documents/Akamine_workspace/master_thesis
 DEVNET_WEIGHT       = r"C:/Users/ishiz/Documents/Akamine_workspace/master_thesis_2025/SMR_control_3D/devision_net/devnet_data_new/all_dataset/prm01/model_final.pth"
 
 # seg-net（left/center/right の3クラス）
-# ★あなたの3D segデータ/weightに置き換えてください
 SEG3_TRAIN_JSON   = r"C:/Users/ishiz/Documents/Akamine_workspace/master_thesis_2025/SMR_control_3D/module_controller/IK/1module_jsons_3D_dataset/annotations.json"
 SEG3_TRAIN_IMAGES = r"C:/Users/ishiz/Documents/Akamine_workspace/master_thesis_2025/SMR_control_3D/module_controller/IK/1module_jsons_3D_dataset/"
 SEG3_WEIGHT       = r"C:/Users/ishiz/Documents/Akamine_workspace/master_thesis_2025/SMR_control_3D/module_controller/IK/1module_jsons_3D_dataset/prm01/model_final.pth"
@@ -139,13 +136,13 @@ def capture_frame(cap, grab_n=5):
     if not ret:
         print("[Camera] Failed to grab frame.")
         return None
-    print(f"[Camera] captured frame shape: {frame.shape}")
     return frame
 
 
 def init_serial(port: str, baudrate: int):
     print(f"[Serial] Opening {port}@{baudrate} ...")
     ser = Serial(port, baudrate, timeout=1)
+
     # Arduino から READY が来るまで待つ（あなたの既存仕様）
     while True:
         line = ser.readline().decode(errors="ignore").strip()
@@ -153,15 +150,17 @@ def init_serial(port: str, baudrate: int):
             print(f"[Serial] <- {line}")
         if line == "READY":
             break
+
     print("[Serial] Arduino READY")
     return ser
 
 
 def reset_voltages_to_zero(ser, n_channels):
     zeros = [0.0] * n_channels
-    cmd = "VOLT " + ",".join(f"{v:.1f}" for v in zeros) + "/n"
+    cmd = "VOLT " + ",".join(f"{v:.1f}" for v in zeros) + "\n"
     print(f"[Serial] -> {cmd.strip()}  (reset)")
     ser.write(cmd.encode())
+
     while True:
         resp = ser.readline().decode(errors="ignore").strip()
         if resp:
@@ -187,7 +186,6 @@ def send_voltages_to_arduino_3d(ser, module_volts_lcr, max_module=5, order="inte
 
     arr = np.zeros((max_module, 3), dtype=np.float32)
     arr[:M_use, :] = module_volts_lcr[:M_use, :]
-
     arr = np.clip(arr, 0.0, 5.0)
 
     if order == "grouped":
@@ -196,12 +194,11 @@ def send_voltages_to_arduino_3d(ser, module_volts_lcr, max_module=5, order="inte
         R = arr[:, 2].tolist()
         volts = L + C + R
     else:
-        # interleave
         volts = []
         for i in range(max_module):
             volts += [float(arr[i, 0]), float(arr[i, 1]), float(arr[i, 2])]
 
-    cmd = "VOLT " + ",".join(f"{v:.1f}" for v in volts) + "/n"
+    cmd = "VOLT " + ",".join(f"{v:.1f}" for v in volts) + "\n"
     print(f"[Serial] -> {cmd.strip()}")
     ser.write(cmd.encode())
 
@@ -280,9 +277,6 @@ def compute_mse_and_overlay(img_target_roi, cam_full_frame, step_idx, base_dir):
     return mse, overlay_path
 
 
-import numpy as np
-from PIL import Image
-
 def recolor_from_rb(arr_rgb: np.ndarray, gamma=0.8, gain_only=1.2, gain_overlap=1.0) -> np.ndarray:
     """
     加算済みRGBから、R/Bの共通成分を推定して
@@ -307,139 +301,123 @@ def recolor_from_rb(arr_rgb: np.ndarray, gamma=0.8, gain_only=1.2, gain_overlap=
     return (out01 * 255.0).astype(np.uint8)
 
 
+# =========================================================
+#  ★ mse_ref（step0）基準版：MSEプロット＋GIF＋CSV
+# =========================================================
 
-def create_mse_plot_and_gif(
+def create_mse_plot_and_gif_global_ref(
     mse_list,
     overlay_paths,
     save_dir,
+    global_ref,
     gif_duration=1.0,
-    # ★ recolorパラメータ
     recolor=True,
     gamma: float = 0.8,
     gain_only: float = 1.3,
     gain_overlap: float = 0.9,
-    # ★ 初期値基準の規格化MSEを出す
-    save_norm_ref: bool = True,
-    # ★ CSVにも保存する（後でオーバープロットが楽）
     save_csv: bool = True,
+    exclude_step0: bool = True,
 ):
-    # ---- step軸 ----
-    steps = list(range(len(mse_list)))
+    """
+    global_ref を全ステップに共通適用:
+      mse_norm = mse_raw / global_ref
+    ※step0は「見た目上」外す（基準には使わない）
+    """
+    os.makedirs(save_dir, exist_ok=True)
 
-    # =========================
-    # 生MSE（step）
-    # =========================
+    mse_arr = np.asarray(mse_list, dtype=np.float32)
+    if mse_arr.size == 0:
+        print("[Timeline] empty mse_list, skip.")
+        return
+
+    # 表示対象（exclude_step0なら1:）
+    idx0 = 1 if (exclude_step0 and len(mse_arr) >= 2) else 0
+
+    steps = list(range(len(mse_arr)))[idx0:]
+    dt = WAIT_TIME + LOOP_WAIT
+    time_axis = [s * dt for s in steps]
+
+    mse_plot = mse_arr[idx0:]
+
+    global_ref = float(max(global_ref, 1e-8))
+    mse_norm = (mse_plot / global_ref).astype(np.float32)
+
+    # --- raw step ---
     plt.figure(figsize=(6, 4))
-    plt.plot(steps, mse_list, marker="o")
+    plt.plot(steps, mse_plot.tolist(), marker="o")
     plt.xlabel("Time step")
     plt.ylabel("MSE (target ROI vs camera ROI)")
-    plt.title("MSE over time")
+    #plt.title("MSE over time")
     plt.grid(True, linestyle="--", alpha=0.5)
     plt.xlim(0, NUM_LOOP)
     plt.tight_layout()
     path_step = os.path.join(save_dir, "mse_time_series.png")
     plt.savefig(path_step)
     plt.close()
-    print(f"[Timeline] MSE plot saved -> {path_step}")
 
-    # ---- time軸 ----
-    dt = WAIT_TIME + LOOP_WAIT
-    time_axis = [s * dt for s in steps]
-
-    # =========================
-    # 生MSE（time）
-    # =========================
+    # --- raw time ---
     plt.figure(figsize=(6, 4))
-    plt.plot(time_axis, mse_list, marker="o")
+    plt.plot(time_axis, mse_plot.tolist(), marker="o")
     plt.xlabel("Time [s]")
     plt.ylabel("MSE (target ROI vs camera ROI)")
-    plt.title("MSE over time (sec)")
+    #plt.title("MSE over time (sec)")
     plt.grid(True, linestyle="--", alpha=0.5)
     plt.xlim(0, NUM_LOOP * dt)
     plt.tight_layout()
     path_time = os.path.join(save_dir, "mse_time_series_time.png")
     plt.savefig(path_time)
     plt.close()
-    print(f"[Timeline] MSE(time) plot saved -> {path_time}")
 
-    # =========================
-    # ★追加：初期値基準の規格化（mse / mse_ref）
-    # =========================
-    mse_arr = np.asarray(mse_list, dtype=np.float32)
-    eps = 1e-8
+    # --- norm (global_ref) step ---
+    plt.figure(figsize=(6, 4))
+    plt.plot(steps, mse_norm.tolist(), marker="o")
+    plt.xlabel("Time step")
+    plt.ylabel("Normalized MSE")
+    #plt.title("Normalized MSE over steps (global_ref)")
+    plt.grid(True, linestyle="--", alpha=0.5)
+    plt.ylim(bottom=0.0)
+    plt.xlim(0, NUM_LOOP)
+    plt.tight_layout()
+    path_step_n = os.path.join(save_dir, "mse_time_series_norm_global_ref.png")
+    plt.savefig(path_step_n)
+    plt.close()
 
-    # mse_ref は step=0 を基準（初期カメラ）
-    # もし step=0 を使わないなら次行を mse_arr[1] に変更
-    mse_ref = float(mse_arr[0]) if len(mse_arr) > 0 else np.nan
+    # --- norm (global_ref) time ---
+    plt.figure(figsize=(6, 4))
+    plt.plot(time_axis, mse_norm.tolist(), marker="o")
+    plt.xlabel("Time [s]")
+    plt.ylabel("Normalized MSE")
+    #plt.title("Normalized MSE over time (global_ref)")
+    plt.grid(True, linestyle="--", alpha=0.5)
+    plt.ylim(bottom=0.0)
+    plt.xlim(0, NUM_LOOP * dt)
+    plt.tight_layout()
+    path_time_n = os.path.join(save_dir, "mse_time_series_time_norm_global_ref.png")
+    plt.savefig(path_time_n)
+    plt.close()
 
-    if save_norm_ref:
-        if np.isfinite(mse_ref):
-            mse_norm_ref = mse_arr / (mse_ref + eps)
-        else:
-            mse_norm_ref = np.full_like(mse_arr, np.nan)
-
-        # 見やすさのため、下限だけ0に（上限は固定しない：悪化すると1超えるため）
-        # step軸（規格化）
-        plt.figure(figsize=(6, 4))
-        plt.plot(steps, mse_norm_ref.tolist(), marker="o")
-        plt.xlabel("Time step")
-        plt.ylabel("Normalized MSE (MSE / MSE_ref)")
-        plt.title("Normalized MSE over steps (ref = initial)")
-        plt.grid(True, linestyle="--", alpha=0.5)
-        plt.ylim(bottom=0.0)
-        plt.xlim(0, NUM_LOOP)
-        plt.tight_layout()
-        path_step_n = os.path.join(save_dir, "mse_time_series_norm_ref.png")
-        plt.savefig(path_step_n)
-        plt.close()
-        print(f"[Timeline] Normalized(step) saved -> {path_step_n} (mse_ref={mse_ref:.6g})")
-
-        # time軸（規格化）
-        plt.figure(figsize=(6, 4))
-        plt.plot(time_axis, mse_norm_ref.tolist(), marker="o")
-        plt.xlabel("Time [s]")
-        plt.ylabel("Normalized MSE (MSE / MSE_ref)")
-        plt.title("Normalized MSE over time (ref = initial)")
-        plt.grid(True, linestyle="--", alpha=0.5)
-        plt.ylim(bottom=0.0)
-        plt.xlim(0, NUM_LOOP * dt)
-        plt.tight_layout()
-        path_time_n = os.path.join(save_dir, "mse_time_series_time_norm_ref.png")
-        plt.savefig(path_time_n)
-        plt.close()
-        print(f"[Timeline] Normalized(time) saved -> {path_time_n}")
-
-    # =========================
-    # ★CSV保存（後で比較が楽）
-    # =========================
+    # --- CSV ---
     if save_csv:
-        # 保存する正規化列（save_norm_ref=Falseでも列は作れるようにしておく）
-        if np.isfinite(mse_ref):
-            mse_norm_ref_for_csv = (mse_arr / (mse_ref + eps)).astype(np.float32)
-        else:
-            mse_norm_ref_for_csv = np.full_like(mse_arr, np.nan)
-
         csv_path = os.path.join(save_dir, "mse_time_series.csv")
-        import csv as _csv
         with open(csv_path, "w", newline="", encoding="utf-8") as f:
-            w = _csv.writer(f)
-            w.writerow(["time_sec", "step", "mse_raw", "mse_ref", "mse_norm_ref"])
-            for s, t, m, mn in zip(steps, time_axis, mse_arr.tolist(), mse_norm_ref_for_csv.tolist()):
-                w.writerow([t, s, m, mse_ref, mn])
+            w = csv.writer(f)
+            w.writerow(["time_sec", "step", "mse_raw", "global_ref", "mse_norm_global_ref"])
+            for s, t, m, mn in zip(steps, time_axis, mse_plot.tolist(), mse_norm.tolist()):
+                w.writerow([t, s, m, global_ref, mn])
         print(f"[Timeline] MSE CSV saved -> {csv_path}")
 
     # =========================
     # GIF（再配色→固定パレットで量子化）
     # =========================
     frames_rgb = []
-    for p in overlay_paths:
+    # overlay_paths も同じように idx0 以降のみ対象
+    for p in overlay_paths[idx0:]:
         if p is None:
             continue
         img_bgr = cv2.imread(p)
         if img_bgr is None:
             continue
         img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-
         if recolor:
             img_rgb = recolor_from_rb(
                 img_rgb,
@@ -447,7 +425,6 @@ def create_mse_plot_and_gif(
                 gain_only=gain_only,
                 gain_overlap=gain_overlap,
             )
-
         frames_rgb.append(Image.fromarray(img_rgb, mode="RGB"))
 
     if not frames_rgb:
@@ -457,10 +434,7 @@ def create_mse_plot_and_gif(
     gif_path = os.path.join(save_dir, "overlay_time_series.gif")
     frame_ms = int(gif_duration * 1000)
 
-    # 先頭フレームで固定パレット作成
     p0 = frames_rgb[0].convert("P", palette=Image.ADAPTIVE, colors=256)
-
-    # 同じパレットで量子化
     frames_p = [p0]
     for fr in frames_rgb[1:]:
         frames_p.append(fr.quantize(palette=p0))
@@ -478,14 +452,104 @@ def create_mse_plot_and_gif(
     print(f"[Timeline] GIF saved -> {gif_path} (frames={len(frames_p)})")
 
 
+# =========================================================
+#  ★ trial集約：mean±std（帯） + CSV(long/summary)
+# =========================================================
+
+def plot_mean_std_band(save_path_png, x, mean, std, xlabel, ylabel, title, xlim=None):
+    x = np.asarray(x, dtype=np.float64)
+    mean = np.asarray(mean, dtype=np.float64)
+    std = np.asarray(std, dtype=np.float64)
+
+    plt.figure(figsize=(6, 4))
+    plt.plot(x, mean, marker="o")
+    plt.fill_between(x, mean - std, mean + std, alpha=0.2)
+    plt.xlabel(xlabel)
+    plt.ylabel(ylabel)
+    #plt.title(title)
+    plt.grid(True, linestyle="--", alpha=0.5)
+    if xlim is not None:
+        plt.xlim(*xlim)
+    plt.tight_layout()
+    plt.savefig(save_path_png)
+    plt.close()
+
+def save_mse_trials_long_csv_global_ref(save_path, mse_trials, dt, meta, global_ref, exclude_step0=True):
+    """
+    long形式：各行が (trial_id, step) の1点
+    mse_norm = mse_raw / global_ref で統一
+    """
+    n_trials = len(mse_trials)
+    if n_trials == 0:
+        return
+
+    T = min(len(x) for x in mse_trials)
+    idx0 = 1 if (exclude_step0 and T >= 2) else 0
+
+    global_ref = float(max(global_ref, 1e-8))
+
+    fieldnames = [
+        "target_name", "max_module", "k_gain", "num_loop", "wait_time", "loop_wait", "reset_each_loop",
+        "trial_id", "step", "time_sec",
+        "mse_raw", "global_ref", "mse_norm_global_ref"
+    ]
+
+    with open(save_path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
+        for tr in range(n_trials):
+            arr = np.asarray(mse_trials[tr][:T], dtype=np.float32)
+            for s in range(idx0, T):
+                w.writerow({
+                    "target_name": meta.get("target_name", ""),
+                    "max_module": meta.get("max_module", ""),
+                    "k_gain": meta.get("k_gain", ""),
+                    "num_loop": meta.get("num_loop", ""),
+                    "wait_time": meta.get("wait_time", ""),
+                    "loop_wait": meta.get("loop_wait", ""),
+                    "reset_each_loop": meta.get("reset_each_loop", ""),
+                    "trial_id": tr,
+                    "step": s,
+                    "time_sec": float(s * dt),
+                    "mse_raw": float(arr[s]),
+                    "global_ref": float(global_ref),
+                    "mse_norm_global_ref": float(arr[s] / global_ref),
+                })
 
 
+def save_mse_summary_csv_global_ref(save_path, steps, times, mean_raw, std_raw, mean_norm, std_norm, meta, global_ref):
+    fieldnames = [
+        "target_name", "max_module", "k_gain", "num_loop", "wait_time", "loop_wait", "reset_each_loop",
+        "global_ref",
+        "step", "time_sec",
+        "mse_mean", "mse_std",
+        "mse_norm_mean", "mse_norm_std"
+    ]
+    with open(save_path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
+        for s, t, mr, sr, mn, sn in zip(steps, times, mean_raw, std_raw, mean_norm, std_norm):
+            w.writerow({
+                "target_name": meta.get("target_name", ""),
+                "max_module": meta.get("max_module", ""),
+                "k_gain": meta.get("k_gain", ""),
+                "num_loop": meta.get("num_loop", ""),
+                "wait_time": meta.get("wait_time", ""),
+                "loop_wait": meta.get("loop_wait", ""),
+                "reset_each_loop": meta.get("reset_each_loop", ""),
+                "global_ref": float(global_ref),
+                "step": int(s),
+                "time_sec": float(t),
+                "mse_mean": float(mr),
+                "mse_std": float(sr),
+                "mse_norm_mean": float(mn),
+                "mse_norm_std": float(sn),
+            })
 
 # =========================================================
 #  3D seg mask: (3,H,W) を作る（Detectron2 生mask）
 # =========================================================
 
-# クラスIDの想定: 0=left, 1=center, 2=right
 CLASS_LEFT = 0
 CLASS_CENTER = 1
 CLASS_RIGHT = 2
@@ -498,8 +562,8 @@ COLOR_RIGHT_BGR  = (255, 0, 0)   # Blue
 def masks3ch_from_segnet(img_bgr, seg_predictor, score_thresh=0.0, assign_mode="class"):
     """
     assign_mode:
-      - "class": 既存の方式（pred_classes で left/center/right を決める）
-      - "xsort": 検出インスタンスの重心 x で 左→中央→右 に並べて ch=0/1/2 に割り当てる
+      - "class": pred_classes で left/center/right を決める
+      - "xsort": 重心xで 左→中央→右 に並べて ch=0/1/2 に割り当てる
     Returns:
       ok: bool
       mask3: (3,H,W) float32 in {0,1}
@@ -520,7 +584,6 @@ def masks3ch_from_segnet(img_bgr, seg_predictor, score_thresh=0.0, assign_mode="
     masks = inst.pred_masks.numpy().astype(bool)
 
     if assign_mode == "class":
-        # 各クラスごとに「スコア最大の1枚」を採用
         for cls_id, ch in [(CLASS_LEFT, 0), (CLASS_CENTER, 1), (CLASS_RIGHT, 2)]:
             idxs = np.where(classes == cls_id)[0]
             if idxs.size == 0:
@@ -531,7 +594,6 @@ def masks3ch_from_segnet(img_bgr, seg_predictor, score_thresh=0.0, assign_mode="
             mask3[ch] = np.maximum(mask3[ch], masks[best_i].astype(np.float32))
 
     elif assign_mode == "xsort":
-        # まず score_thresh を満たす候補を集める
         keep = np.where(scores >= score_thresh)[0]
         if keep.size == 0:
             return False, mask3, img_bgr.copy(), {"reason": "all_below_thresh"}
@@ -542,30 +604,26 @@ def masks3ch_from_segnet(img_bgr, seg_predictor, score_thresh=0.0, assign_mode="
             if not m.any():
                 continue
             ys, xs = np.where(m)
-            cx = float(xs.mean())          # 重心x
+            cx = float(xs.mean())
             area = int(m.sum())
             items.append((cx, scores[i], area, i))
 
         if len(items) == 0:
             return False, mask3, img_bgr.copy(), {"reason": "no_valid_masks"}
 
-        # ノイズ除去（小さすぎるmaskを落とす：閾値は必要なら調整）
         items = [t for t in items if t[2] >= 20]
         if len(items) == 0:
             return False, mask3, img_bgr.copy(), {"reason": "all_too_small"}
 
-        # 3本を選ぶ：score上位3つ→cxで左→右に並べる（これが一番安定しやすい）
         items = sorted(items, key=lambda t: t[1], reverse=True)[:3]
         items = sorted(items, key=lambda t: t[0])
 
-        # 左→右 を ch=0/1/2 に割り当て
         for ch, (_, _, _, i) in enumerate(items):
             mask3[ch] = np.maximum(mask3[ch], masks[i].astype(np.float32))
 
     else:
         raise ValueError(f"unknown assign_mode: {assign_mode}")
 
-    # overlay（可視化専用）
     overlay = img_bgr.copy().astype(np.float32)
     alpha = 0.5
 
@@ -592,9 +650,8 @@ def masks3ch_from_segnet(img_bgr, seg_predictor, score_thresh=0.0, assign_mode="
     return True, mask3.astype(np.float32), overlay, info
 
 
-
 # =========================================================
-#  bbox → center crop（2Dコードの挙動に合わせる：範囲外は黒+ノイズ補完）
+#  bbox → center crop（範囲外は黒+ノイズ補完）
 # =========================================================
 
 MEAN_BGR = np.array([128.04, 131.38, 132.08], dtype=np.float32)
@@ -604,9 +661,11 @@ BLEND_WIDTH = 5.0
 CROP_H = 70
 CROP_W = 70
 
+
 def sample_border_noise(H, W):
     noise = np.random.normal(MEAN_BGR, STD_BGR, size=(H, W, 3))
     return np.clip(noise, 0, 255).astype(np.uint8)
+
 
 def make_center_crops_in_memory(img_bgr, boxes, crop_h=CROP_H, crop_w=CROP_W):
     H, W, _ = img_bgr.shape
@@ -670,7 +729,7 @@ def load_target_voltages_from_signals(signals_csv_path: Path, img_name_noext: st
         print(f"[WARN] target filename is not integer-like: {img_name_noext}. Skip target_voltages.")
         return None
 
-    df = pd.read_csv(signals_csv_path, header=0)  # headerあり
+    df = pd.read_csv(signals_csv_path, header=0)
     row_idx = n - 1
     if row_idx < 0 or row_idx >= len(df):
         print(f"[WARN] row_idx out of range: {row_idx} (n={n})")
@@ -678,7 +737,6 @@ def load_target_voltages_from_signals(signals_csv_path: Path, img_name_noext: st
 
     row = df.iloc[row_idx]
 
-    # L1,C1,R1,L2,C2,R2,... を取り出して (M,3)
     M = min(int(n_modules), MAX_MODULE)
     out = np.zeros((M, 3), dtype=np.float32)
 
@@ -701,13 +759,6 @@ def load_target_voltages_from_signals(signals_csv_path: Path, img_name_noext: st
 # =========================================================
 
 def plot_voltage_bars_3ch(tv, pv, out_dir, step_idx):
-    """
-    tv,pv: (M,3)
-    save:
-      voltage_bar_left_stepXX.png
-      voltage_bar_center_stepXX.png
-      voltage_bar_right_stepXX.png
-    """
     os.makedirs(out_dir, exist_ok=True)
     M = tv.shape[0]
     x = np.arange(1, M + 1)
@@ -743,7 +794,7 @@ def plot_voltage_bars_3ch(tv, pv, out_dir, step_idx):
 def run_feedback_loop_3d(
     img_target_roi,
     boxes_target,
-    initial_voltages,     # (M,3) start voltages (typically zeros)
+    initial_voltages,     # (M,3) start voltages
     first_cam_frame,
     dev_predictor,
     seg3_predictor,
@@ -760,14 +811,6 @@ def run_feedback_loop_3d(
     cap=None,
     target_voltages=None,  # (M,3) or None
 ):
-    """
-    3D版:
-      input x = concat([mask_cam(3), mask_target(3), q_map(3)]) -> (9,H,W)
-      output y_hat = (3,) voltage for next
-      update: V_next_raw = V_i + K_gain*(V_ik - V_i), then clip 0..5
-    """
-
-    # ---- target crops & target masks3 を先に全部作る ----
     print("[FB-IK-3D] Preparing target center crops & 3ch masks ...")
     target_crops = make_center_crops_in_memory(img_target_roi, boxes_target, crop_h=CROP_H, crop_w=CROP_W)
     num_modules = len(target_crops)
@@ -787,22 +830,19 @@ def run_feedback_loop_3d(
         if not ok:
             print(f"[FB-IK-3D] failed target seg for module {m_idx}, abort.")
             return [], [], []
-
         target_masks3.append(mask3)
 
         cv2.imwrite(os.path.join(targ_dbg_dir, f"mod{m_idx}_targ_crop.png"), crop)
         cv2.imwrite(os.path.join(targ_dbg_dir, f"mod{m_idx}_targ_overlay.png"), overlay)
         np.save(os.path.join(targ_dbg_dir, f"mod{m_idx}_targ_mask3.npy"), mask3)
 
-    # ---- timeline buffers ----
     mse_list_fb = []
     overlay_paths_fb = []
-    bar_paths_fb = []  # 3枚のうち代表（ここでは left のパスだけ溜める等）でもOK。今回は3枚全部作るのでdirだけ溜める。
+    bar_paths_fb = []
 
     cam_frame = first_cam_frame.copy()
     x_roi, y_roi, w_roi, h_roi = load_roi_config(ROI_CONFIG_FULL)
 
-    # 現在電圧 (num_modules,3)
     current_voltages = np.array(initial_voltages, dtype=np.float32).copy()
     if current_voltages.shape[0] < num_modules:
         pad = np.zeros((num_modules - current_voltages.shape[0], 3), dtype=np.float32)
@@ -814,7 +854,7 @@ def run_feedback_loop_3d(
     current_step_idx = start_step_idx
 
     for loop in range(num_loops):
-        print(f"/n[FB-IK-3D] ===== Feedback loop {loop+1}/{num_loops} =====")
+        print(f"\n[FB-IK-3D] ===== Feedback loop {loop+1}/{num_loops} =====")
 
         fb_dir = os.path.join(base_save_dir, f"fb_step_{loop+1:02d}")
         os.makedirs(fb_dir, exist_ok=True)
@@ -833,7 +873,6 @@ def run_feedback_loop_3d(
             break
         cv2.imwrite(os.path.join(fb_dir, "roi_captured_raw.png"), roi_cam)
 
-        # target vs current ROI overlay (赤青)
         H_t, W_t = img_target_roi.shape[:2]
         roi_cam_resized = cv2.resize(roi_cam, (W_t, H_t))
         overlay_local = cv2.addWeighted(
@@ -842,18 +881,11 @@ def run_feedback_loop_3d(
             0
         )
 
-        # ★ recolor（BGR→RGB→recolor→BGR）
         overlay_rgb = cv2.cvtColor(overlay_local, cv2.COLOR_BGR2RGB)
         overlay_rgb = recolor_from_rb(overlay_rgb, gamma=0.8, gain_only=1.3, gain_overlap=0.9)
         overlay_local_recolor = cv2.cvtColor(overlay_rgb, cv2.COLOR_RGB2BGR)
+        cv2.imwrite(os.path.join(fb_dir, "roi_overlay_red_orig_blue_cap.png"), overlay_local_recolor)
 
-        cv2.imwrite(
-            os.path.join(fb_dir, "roi_overlay_red_orig_blue_cap.png"),
-            overlay_local_recolor
-        )
-
-
-        # devnet detect modules on camera ROI
         out_cam = dev_predictor(roi_cam)
         inst_cam = out_cam["instances"].to("cpu")
         if len(inst_cam) == 0:
@@ -862,7 +894,6 @@ def run_feedback_loop_3d(
 
         boxes_cam = inst_cam.pred_boxes.tensor.numpy()
         masks_cam = inst_cam.pred_masks.numpy()
-        num_cam_masks = masks_cam.shape[0]
 
         vis_cam = Visualizer(roi_cam[:, :, ::-1], metadata=None, scale=1.0)
         out_vis_cam = vis_cam.overlay_instances(masks=masks_cam, boxes=None, labels=None)
@@ -884,13 +915,12 @@ def run_feedback_loop_3d(
                 print(f"[FB-IK-3D] seg failed cam module {m_idx}, skip.")
                 continue
 
-            # 保存（デバッグ）
             cv2.imwrite(os.path.join(fb_dir, f"mod{m_idx}_cam_crop.png"), cam_crop)
             cv2.imwrite(os.path.join(fb_dir, f"mod{m_idx}_cam_overlay.png"), cam_overlay)
             np.save(os.path.join(fb_dir, f"mod{m_idx}_cam_mask3.npy"), cam_mask3)
             np.save(os.path.join(fb_dir, f"mod{m_idx}_targ_mask3.npy"), targ_mask3)
 
-            v_i = current_voltages[m_idx].astype(np.float32)  # (3,)
+            v_i = current_voltages[m_idx].astype(np.float32)
             Hm, Wm = cam_mask3.shape[1], cam_mask3.shape[2]
 
             q_map = np.zeros((3, Hm, Wm), dtype=np.float32)
@@ -899,15 +929,13 @@ def run_feedback_loop_3d(
             q_map[2, :, :] = v_i[2] / 5.0
 
             x = np.concatenate([cam_mask3, targ_mask3, q_map], axis=0)  # (9,H,W)
-
             x_t = torch.from_numpy(x).unsqueeze(0).to(device)  # (1,9,H,W)
+
             with torch.no_grad():
                 y_hat = ik_model(x_t)  # (1,3)
 
-            v_ik = y_hat[0].detach().cpu().numpy().astype(np.float32)  # (3,)
-            v_ik = v_ik  # 生値
+            v_ik = y_hat[0].detach().cpu().numpy().astype(np.float32)
 
-            # feedback
             dV = v_ik - v_i
             v_next_raw = v_i + K_gain * dV
             v_next_clip = np.clip(v_next_raw, 0.0, 5.0)
@@ -922,28 +950,21 @@ def run_feedback_loop_3d(
                 f"V_next_clip=({v_next_clip[0]:.3f},{v_next_clip[1]:.3f},{v_next_clip[2]:.3f})"
             )
 
-        # 保存
         np.savetxt(os.path.join(fb_dir, "ik_pred_voltages_raw.txt"), V_next_raw, fmt="%.4f")
         np.savetxt(os.path.join(fb_dir, "ik_pred_voltages_clipped.txt"), V_next_clipped, fmt="%.4f")
 
-        # pred vs target bars (3枚)
         if target_voltages is not None:
-            tv = np.array(target_voltages, dtype=np.float32)
-            tv = tv[:num_modules, :]
+            tv = np.array(target_voltages, dtype=np.float32)[:num_modules, :]
             pv = V_next_clipped[:num_modules, :]
 
-            # signals.csv 仕様で存在しないモジュールは0の可能性があるので除外（全部0の行）
             valid = np.any(tv > 0.0, axis=1)
             tvp = tv[valid]
             pvp = pv[valid]
             if tvp.shape[0] > 0:
                 plot_voltage_bars_3ch(tvp, pvp, out_dir=fb_dir, step_idx=loop+1)
-                # 代表として left だけ溜める（GIF作るならここで3つ作るのも可）
                 bar_paths_fb.append(os.path.join(fb_dir, f"voltage_bar_left_step{loop+1:02d}.png"))
 
-        # Arduino 送信（clip後）
         send_voltages_to_arduino_3d(ser, V_next_clipped, max_module=MAX_MODULE, order="interleave")
-
         current_voltages = V_next_clipped.copy()
 
         print(f"[FB-IK-3D] Waiting {wait_sec} sec ...")
@@ -959,9 +980,8 @@ def run_feedback_loop_3d(
         overlay_paths_fb.append(overlay_t)
         current_step_idx += 1
 
-        # MSEログ
-        with open(os.path.join(base_save_dir, "mse_each_step.txt"), "a") as f:
-            f.write(f"{loop+1},{mse_t:.6f}/n")
+        with open(os.path.join(base_save_dir, "mse_each_step.txt"), "a", encoding="utf-8") as f:
+            f.write(f"{loop+1},{mse_t:.6f}\n")
 
         cam_frame = cam_next.copy()
 
@@ -974,190 +994,282 @@ def run_feedback_loop_3d(
 
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
+    print(f"[INFO] Using device: {device}")
 
-    # camera open
+    # =========================
+    # Camera
+    # =========================
     cap = open_camera(CAMERA_INDEX, width=CAM_W, height=CAM_H)
     if cap is None:
-        print("[ERROR] Could not open camera. Abort.")
+        print("[ERROR] Could not open camera.")
         return
 
-    # t=0 initial camera frame
-    print("[INFO] Capturing initial camera frame (t=0) ...")
-    initial_cam_frame = capture_frame(cap)
-
-    # devnet
+    # =========================
+    # devnet predictor
+    # =========================
     try:
         register_coco_instances("DEV_TRAIN", {}, DEVNET_TRAIN_JSON, DEVNET_TRAIN_IMAGES)
     except Exception:
         pass
+
     cfg_dev = get_cfg()
-    cfg_dev.merge_from_file(model_zoo.get_config_file("COCO-InstanceSegmentation/mask_rcnn_R_50_FPN_3x.yaml"))
+    cfg_dev.merge_from_file(
+        model_zoo.get_config_file(
+            "COCO-InstanceSegmentation/mask_rcnn_R_50_FPN_3x.yaml"
+        )
+    )
     cfg_dev.MODEL.WEIGHTS = DEVNET_WEIGHT
     cfg_dev.MODEL.ROI_HEADS.NUM_CLASSES = 1
-    cfg_dev.MODEL.DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
     cfg_dev.MODEL.ROI_HEADS.SCORE_THRESH_TEST = 0.8
+    cfg_dev.MODEL.DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
     cfg_dev.DATASETS.TEST = ()
     dev_predictor = DefaultPredictor(cfg_dev)
-    dev_metadata = MetadataCatalog.get("DEV_TRAIN")
 
-    # seg-net 3class
+    # =========================
+    # seg-net predictor
+    # =========================
     try:
         register_coco_instances("SEG3_TRAIN", {}, SEG3_TRAIN_JSON, SEG3_TRAIN_IMAGES)
     except Exception:
         pass
+
     cfg_seg = get_cfg()
-    cfg_seg.merge_from_file(model_zoo.get_config_file("COCO-InstanceSegmentation/mask_rcnn_R_50_FPN_3x.yaml"))
+    cfg_seg.merge_from_file(
+        model_zoo.get_config_file(
+            "COCO-InstanceSegmentation/mask_rcnn_R_50_FPN_3x.yaml"
+        )
+    )
     cfg_seg.MODEL.WEIGHTS = SEG3_WEIGHT
     cfg_seg.MODEL.ROI_HEADS.NUM_CLASSES = 3
-    cfg_seg.MODEL.DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
     cfg_seg.MODEL.ROI_HEADS.SCORE_THRESH_TEST = 0.3
+    cfg_seg.MODEL.DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
     cfg_seg.DATASETS.TEST = ()
     seg3_predictor = DefaultPredictor(cfg_seg)
 
-    # IK model load (3D)
+    # =========================
+    # IK model
+    # =========================
     ik_model = IKBeamNet(in_ch=9, feat_dim=128).to(device)
     ckpt = torch.load(IK_MODEL_PATH, map_location=device)
-    state = ckpt.get("model_state_dict", ckpt)
-    ik_model.load_state_dict(state)
+    ik_model.load_state_dict(ckpt.get("model_state_dict", ckpt))
     ik_model.eval()
-    print(f"[INFO] Loaded IK model: {IK_MODEL_PATH}")
 
-    # target image select
-    img_path = select_image_via_dialog()
-    if img_path is None:
-        cap.release()
-        return
+    # =========================
+    # Serial
+    # =========================
+    ser = init_serial(SERIAL_PORT, BAUDRATE)
 
-    img_bgr = cv2.imread(img_path)
-    if img_bgr is None:
-        print(f"[ERROR] Failed to read image: {img_path}")
-        cap.release()
-        return
+    # =========================
+    # 保存先
+    # =========================
+    os.makedirs(SAVE_ROOT, exist_ok=True)
 
-    img_name = os.path.splitext(os.path.basename(img_path))[0]
+    # =========================
+    # 集約用
+    # =========================
+    mse_trials = []        # list[list[float]]
+    trial_metas = []      # target名など
+    REF_STEP = 1           # step=1 を初期
+    if RESET_EACH_LOOP:
+        dt = WAIT_TIME + LOOP_WAIT
+    else:
+        dt = LOOP_WAIT
 
-    # save dir
-    # folder_name = f"3D_ModuleMax{MAX_MODULE}_K={K_GAIN:.1f}_Loop{NUM_LOOP}_Reset{RESET_EACH_LOOP}_Wait{WAIT_TIME:.1f}_Freq{LOOP_WAIT:.1f}"
-    # RESULT_ROOT = os.path.join(BASE_ROOT, folder_name)
-    # os.makedirs(RESULT_ROOT, exist_ok=True)
+    # ==================================================
+    # trial loop（targetごと）
+    # ==================================================
+    for trial in range(N_TRIALS):
+        print("\n============================")
+        print(f"[TRIAL] {trial+1}/{N_TRIALS}")
+        print("============================")
 
-    save_dir = os.path.join(SAVE_ROOT, f"selected_{img_name}")
-    os.makedirs(save_dir, exist_ok=True)
+        # -------- target選択 --------
+        img_path = select_image_via_dialog()
+        if img_path is None:
+            print("[INFO] Target selection cancelled. Skip.")
+            continue
 
-    cv2.imwrite(os.path.join(save_dir, f"{img_name}_roi_input.png"), img_bgr)
+        img_bgr = cv2.imread(img_path)
+        if img_bgr is None:
+            print("[WARN] Failed to read target image. Skip.")
+            continue
 
-    # timeline buffers
-    timeline_mse = []
-    timeline_overlays = []
+        target_name = os.path.basename(img_path)
+        img_stem = os.path.splitext(target_name)[0]
 
-    if initial_cam_frame is not None:
-        mse0, ov0 = compute_mse_and_overlay(img_bgr, initial_cam_frame, step_idx=0, base_dir=save_dir)
+        trial_dir = os.path.join(SAVE_ROOT, f"trial_{trial:02d}_{img_stem}")
+        os.makedirs(trial_dir, exist_ok=True)
+        cv2.imwrite(
+            os.path.join(trial_dir, f"{img_stem}_roi_input.png"),
+            img_bgr,
+        )
+
+        # -------- devnet --------
+        out = dev_predictor(img_bgr)
+        inst = out["instances"].to("cpu")
+        if len(inst) == 0:
+            print("[WARN] No detection in target image. Skip.")
+            continue
+
+        boxes = inst.pred_boxes.tensor.numpy()
+        n_mod = min(len(boxes), MAX_MODULE)
+
+        # -------- target voltages（任意） --------
+        target_voltages = None
+        try:
+            img_p = Path(img_path)
+            dataset_dir = img_p.parent.parent
+            signals_path = dataset_dir / "signals.csv"
+            target_voltages = load_target_voltages_from_signals(
+                signals_path,
+                img_stem,
+                n_modules=n_mod,
+            )
+        except Exception:
+            target_voltages = None
+
+        # -------- step0 / step1 --------
+        timeline_mse = []
+        timeline_overlays = []
+
+        cam0 = capture_frame(cap)
+        mse0, ov0 = compute_mse_and_overlay(
+            img_bgr, cam0, step_idx=0, base_dir=trial_dir
+        )
         timeline_mse.append(mse0)
         timeline_overlays.append(ov0)
 
-    # devnet on target
-    out = dev_predictor(img_bgr)
-    inst = out["instances"].to("cpu")
-    if len(inst) == 0:
-        print("[INFO] No detection in target image.")
-        cap.release()
-        return
-
-    boxes = inst.pred_boxes.tensor.numpy()
-    masks = inst.pred_masks.numpy()
-
-    vis = Visualizer(img_bgr[:, :, ::-1], metadata=dev_metadata, scale=1.0)
-    out_vis = vis.overlay_instances(masks=masks, boxes=None, labels=None)
-    cv2.imwrite(os.path.join(save_dir, f"{img_name}_devnet_vis.png"),
-                out_vis.get_image()[:, :, ::-1].astype("uint8"))
-
-    # ---- load target voltages from signals.csv (headerあり)
-    target_voltages = None
-    try:
-        img_p = Path(img_path)
-        dataset_dir = img_p.parent.parent  # .../dataset/roi/n.png -> dataset
-        signals_path = dataset_dir / "signals.csv"
-        target_voltages = load_target_voltages_from_signals(signals_path, img_name, n_modules=min(len(boxes), MAX_MODULE))
-        if target_voltages is not None:
-            print(f"[INFO] target_voltages shape: {target_voltages.shape}")
-            np.savetxt(os.path.join(save_dir, "target_voltages.txt"), target_voltages, fmt="%.4f")
-    except Exception as e:
-        print(f"[WARN] Failed to load target_voltages: {e}")
-        target_voltages = None
-
-    # initial voltages start from 0V (detected modules)
-    n_mod = min(int(boxes.shape[0]), MAX_MODULE)
-    initial_voltages = np.zeros((n_mod, 3), dtype=np.float32)
-
-    ser = None
-    bar_paths_fb = []
-    try:
-        ser = init_serial(SERIAL_PORT, BAUDRATE)
-
-        # initial reset
         reset_voltages_to_zero(ser, n_channels=MAX_MODULE * 3)
-        print(f"[INFO] Waiting {WAIT_TIME} sec after initial reset ...")
         time.sleep(WAIT_TIME)
 
-        cam_frame_init = capture_frame(cap)
-        if cam_frame_init is None:
-            print("[WARN] Camera capture failed after reset, abort feedback.")
-        else:
-            cv2.imwrite(os.path.join(save_dir, "captured_full_init.png"), cam_frame_init)
+        cam1 = capture_frame(cap)
+        mse1, ov1 = compute_mse_and_overlay(
+            img_bgr, cam1, step_idx=1, base_dir=trial_dir
+        )
+        timeline_mse.append(mse1)
+        timeline_overlays.append(ov1)
 
-            mse1, ov1 = compute_mse_and_overlay(img_bgr, cam_frame_init, step_idx=1, base_dir=save_dir)
-            timeline_mse.append(mse1)
-            timeline_overlays.append(ov1)
-
-            mse_fb, overlays_fb, bar_paths_fb = run_feedback_loop_3d(
-                img_target_roi=img_bgr,
-                boxes_target=boxes,
-                initial_voltages=initial_voltages,
-                first_cam_frame=cam_frame_init,
-                dev_predictor=dev_predictor,
-                seg3_predictor=seg3_predictor,
-                ik_model=ik_model,
-                device=device,
-                ser=ser,
-                base_save_dir=save_dir,
-                num_loops=NUM_LOOP,
-                wait_sec=LOOP_WAIT,
-                start_step_idx=2,
-                use_reset_between=RESET_EACH_LOOP,
-                K_gain=K_GAIN,
-                reset_wait_sec=WAIT_TIME,
-                cap=cap,
-                target_voltages=target_voltages,
-            )
-            timeline_mse.extend(mse_fb)
-            timeline_overlays.extend(overlays_fb)
-
-        # end reset
-        reset_voltages_to_zero(ser, n_channels=MAX_MODULE * 3)
-
-    finally:
-        if ser is not None:
-            try:
-                ser.close()
-            except:
-                pass
-        if cap is not None:
-            try:
-                cap.release()
-            except:
-                pass
-
-    # timeline outputs
-    if len(timeline_mse) > 0:
-        create_mse_plot_and_gif(
-            mse_list=timeline_mse[1:],
-            overlay_paths=timeline_overlays[1:],
-            save_dir=save_dir,
-            gif_duration=1.0,
+        # -------- feedback loop --------
+        mse_fb, ov_fb, _ = run_feedback_loop_3d(
+            img_target_roi=img_bgr,
+            boxes_target=boxes,
+            initial_voltages=np.zeros((n_mod, 3), dtype=np.float32),
+            first_cam_frame=cam1,
+            dev_predictor=dev_predictor,
+            seg3_predictor=seg3_predictor,
+            ik_model=ik_model,
+            device=device,
+            ser=ser,
+            base_save_dir=trial_dir,
+            num_loops=NUM_LOOP,
+            wait_sec=LOOP_WAIT,
+            start_step_idx=2,
+            use_reset_between=RESET_EACH_LOOP,
+            K_gain=K_GAIN,
+            reset_wait_sec=WAIT_TIME,
+            cap=cap,
+            target_voltages=target_voltages,
         )
 
-    print(f"/n[INFO] All results saved in: {save_dir}")
+        timeline_mse.extend(mse_fb)
+        timeline_overlays.extend(ov_fb)
+
+        mse_trials.append(timeline_mse)
+        trial_metas.append(
+            dict(
+                trial_id=trial,
+                target_name=target_name,
+            )
+        )
+
+        reset_voltages_to_zero(ser, n_channels=MAX_MODULE * 3)
+
+    # ==================================================
+    # 集約（trialごとref = step1）
+    # ==================================================
+    if len(mse_trials) < 2:
+        print("[WARN] Not enough trials for aggregation.")
+        return
+
+    T = min(len(x) for x in mse_trials)
+    mse_trials = [x[:T] for x in mse_trials]
+    arr = np.asarray(mse_trials, dtype=np.float32)  # (N,T)
+
+    idx0 = REF_STEP
+    steps = np.arange(T)[idx0:]
+    times = steps * dt
+
+    # ---- ★ trialごと正規化 ----
+    refs = arr[:, REF_STEP:REF_STEP+1]
+    refs = np.maximum(refs, 1e-8)
+    arr_norm = arr / refs
+
+    mean_norm = arr_norm.mean(axis=0)[idx0:]
+    std_norm  = arr_norm.std(axis=0, ddof=0)[idx0:]
+
+    # ---- 表示用軸 ----
+    steps_plot = steps - steps[0]
+    times_plot = times - times[0]
+
+    # ---- プロット ----
+    plot_mean_std_band(
+        os.path.join(SAVE_ROOT, "mse_mean_std_steps_norm.png"),
+        steps_plot,
+        mean_norm,
+        std_norm,
+        xlabel="Time step (from initial)",
+        ylabel="Normalized MSE (per-trial ref)",
+        title=f"MSE mean ± std over {len(arr_norm)} targets",
+        xlim=(steps_plot[0], steps_plot[-1]),
+    )
+
+    plot_mean_std_band(
+        os.path.join(SAVE_ROOT, "mse_mean_std_time_norm.png"),
+        times_plot,
+        mean_norm,
+        std_norm,
+        xlabel="Time [s] (from initial)",
+        ylabel="Normalized MSE (per-trial ref)",
+        title=f"MSE mean ± std over {len(arr_norm)} targets",
+        xlim=(times_plot[0], times_plot[-1]),
+    )
+
+    # ==================================================
+    # ★ CSV 出力（ここが前回抜けてた）
+    # ==================================================
+    # long
+    with open(os.path.join(SAVE_ROOT, "mse_trials_long.csv"), "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow([
+            "trial_id", "target_name",
+            "step", "time_sec",
+            "mse_raw", "mse_norm",
+        ])
+        for i in range(arr.shape[0]):
+            for s in range(idx0, T):
+                w.writerow([
+                    trial_metas[i]["trial_id"],
+                    trial_metas[i]["target_name"],
+                    s,
+                    s * dt,
+                    float(arr[i, s]),
+                    float(arr_norm[i, s]),
+                ])
+
+    # summary
+    with open(os.path.join(SAVE_ROOT, "mse_summary.csv"), "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow([
+            "step", "time_sec",
+            "mse_norm_mean", "mse_norm_std",
+        ])
+        for s, t, m, sd in zip(steps, times, mean_norm, std_norm):
+            w.writerow([int(s), float(t), float(m), float(sd)])
+
+    print(f"[INFO] All results saved in {SAVE_ROOT}")
+
+
+
 
 
 if __name__ == "__main__":
